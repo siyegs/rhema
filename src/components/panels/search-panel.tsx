@@ -296,26 +296,12 @@ export function SearchPanel() {
   )
   const quickSuggestion = autocompleteResult.suggestion
 
-  // Side effects only: navigation + verse loading
+  // Track previous navigation target to avoid unnecessary store updates
+  const prevNavKey = useRef<string | null>(null)
+
+  // Fetch chapter for verse dropdown (purely for UI, no navigation)
   useEffect(() => {
     const result = autocompleteResult
-
-    if (result.matchedBook && result.chapter && result.verse) {
-      useBibleStore.getState().setPendingNavigation({
-        bookNumber: result.matchedBook.book_number,
-        chapter: result.chapter,
-        verse: result.verse
-      })
-
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (quickInputRef.current && document.activeElement !== quickInputRef.current) {
-            quickInputRef.current.focus()
-          }
-        })
-      })
-    }
-
     if ((result.stage === "chapter" || result.stage === "verse") && result.matchedBook && result.chapter) {
       invoke<Verse[]>("get_chapter", {
         translationId: activeTranslationId,
@@ -328,12 +314,29 @@ export function SearchPanel() {
     }
   }, [autocompleteResult, activeTranslationId])
 
+  // Only trigger navigation when user explicitly accepts (via Tab/Enter) - not on every keystroke
+  // This prevents re-renders from stealing focus while typing
+  const handleAcceptSuggestion = useCallback(() => {
+    const result = autocompleteResult
+    if (result.matchedBook && result.chapter && result.verse) {
+      const navKey = `${result.matchedBook.book_number}:${result.chapter}:${result.verse}`
+      if (navKey !== prevNavKey.current) {
+        prevNavKey.current = navKey
+        useBibleStore.getState().setPendingNavigation({
+          bookNumber: result.matchedBook.book_number,
+          chapter: result.chapter,
+          verse: result.verse
+        })
+      }
+    }
+  }, [autocompleteResult])
+
   // Derive dropdown visibility: only show when autocomplete stage is chapter/verse
   const shouldShowVerseDropdown = showQuickVerses
     && (autocompleteResult.stage === "chapter" || autocompleteResult.stage === "verse")
 
   const handleQuickKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
-    // Tab or → accepts suggestion and advances to NEXT STAGE
+    // Tab or → accepts suggestion and advances to NEXT STAGE (but doesn't navigate yet)
     if ((e.key === "Tab" || e.key === "ArrowRight") && quickSuggestion && quickSuggestion !== quickInput) {
       e.preventDefault()
       const nextInput = getTabNavigationResult(quickInput, quickSuggestion)
@@ -341,9 +344,12 @@ export function SearchPanel() {
       return
     }
 
-    // Enter clears input (verse is already showing in panel)
+    // Enter - navigate to the selected reference
     if (e.key === "Enter") {
       e.preventDefault()
+      if (autocompleteResult.matchedBook && autocompleteResult.chapter && autocompleteResult.verse) {
+        handleAcceptSuggestion()
+      }
       setQuickInput("")
       setShowQuickVerses(false)
       return
@@ -356,7 +362,7 @@ export function SearchPanel() {
       setShowQuickVerses(false)
       return
     }
-  }, [quickInput, quickSuggestion])
+  }, [quickInput, quickSuggestion, autocompleteResult, handleAcceptSuggestion])
 
   const handleQuickVerseClick = useCallback((verse: Verse) => {
     useBibleStore.getState().setPendingNavigation({
@@ -415,12 +421,15 @@ export function SearchPanel() {
           <div className="flex flex-1 items-center gap-2 pr-3">
             {/* EasyWorship-style autocomplete */}
             <div className="relative flex-1">
-              {/* Suggestion overlay */}
+              {/* Suggestion overlay - visual only, doesn't trigger navigation */}
               {quickSuggestion && quickSuggestion !== quickInput && (
-                <div className="absolute inset-0 flex items-center px-3 pointer-events-none z-10">
-                  <span className="text-xs font-normal">
+                <div 
+                  className="absolute inset-0 flex items-center pointer-events-none select-none z-10" 
+                  aria-hidden="true"
+                >
+                  <span className="text-xs font-normal truncate px-3">
                     <span className="text-foreground">{quickInput}</span>
-                    <span className="text-gray-500 dark:text-gray-400">{quickSuggestion.slice(quickInput.length)}</span>
+                    <span className="text-muted-foreground">{quickSuggestion.slice(quickInput.length)}</span>
                   </span>
                 </div>
               )}
@@ -526,38 +535,77 @@ export function SearchPanel() {
       {/* Book search tab */}
       {activeTab === "book" && (
         <>
-          {/* STICKY: Chapter header */}
+          {/* STICKY: Chapter header with dropdown selectors */}
 
-          <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2 min-h-9">
-            {selectedBook ?
-              <h3 className="text-sm font-semibold text-foreground">
-                {selectedBook.name} {chapter}
-              </h3> : null}
-            {selectedBook ? <div className="flex items-center gap-1">
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={() => {
-                  if (chapter > 1) {
-                    setChapter((c) => c - 1)
-                                setSelectedVerseId(null)
-                  }
-                }}
-                disabled={chapter <= 1}
-              >
-                <ArrowLeftIcon className="size-3" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={() => {
-                  setChapter((c) => c + 1)
-                            setSelectedVerseId(null)
-                }}
-              >
-                <ArrowRightIcon className="size-3" />
-              </Button>
-            </div> : null}
+          <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 min-h-9">
+            {/* Book selector */}
+            <Select
+              value={selectedBook ? String(selectedBook.book_number) : ""}
+              onValueChange={(v) => {
+                const book = books.find(b => b.book_number === Number(v))
+                if (book) {
+                  setSelectedBook(book)
+                  setChapter(1)
+                  setSelectedVerseId(null)
+                }
+              }}
+            >
+              <SelectTrigger className="h-6 text-xs w-[120px]">
+                <SelectValue placeholder="Select book" />
+              </SelectTrigger>
+              <SelectContent>
+                {books.map((book) => (
+                  <SelectItem key={book.book_number} value={String(book.book_number)}>
+                    {book.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            {/* Chapter selector - use max 150 (Psalms has 150 chapters) */}
+            <Select
+              value={String(chapter)}
+              onValueChange={(v) => {
+                setChapter(Number(v))
+                setSelectedVerseId(null)
+              }}
+            >
+              <SelectTrigger className="h-6 text-xs w-[70px]">
+                <SelectValue placeholder="Ch" />
+              </SelectTrigger>
+              <SelectContent className="max-h-60">
+                {Array.from({ length: 150 }, (_, i) => i + 1).map((c) => (
+                  <SelectItem key={c} value={String(c)}>
+                    {c}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            {/* Verse selector */}
+            <Select
+              value={effectiveSelectedVerseId ? String(currentChapter.find(v => v.id === effectiveSelectedVerseId)?.verse || "") : ""}
+              onValueChange={(v) => {
+                const verseNum = Number(v)
+                const verse = currentChapter.find(verse => verse.verse === verseNum)
+                if (verse) {
+                  setSelectedVerseId(verse.id)
+                  bibleActions.selectVerse(verse)
+                  document.getElementById(`verse-${verse.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })
+                }
+              }}
+            >
+              <SelectTrigger className="h-6 text-xs w-[60px]">
+                <SelectValue placeholder="Vs" />
+              </SelectTrigger>
+              <SelectContent className="max-h-60">
+                {currentChapter.map((verse) => (
+                  <SelectItem key={verse.verse} value={String(verse.verse)}>
+                    {verse.verse}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
 
 
